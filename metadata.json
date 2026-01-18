@@ -1,0 +1,7 @@
+{
+  "name": "LiquifyLab",
+  "description": "A professional-grade web photo editor specializing in liquid warping effects like push, pull, bloat, and pucker. Features AI-powered sample image generation.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
