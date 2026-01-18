@@ -12,6 +12,8 @@ interface HistoryStep {
 }
 
 const HISTORY_MAX_STEPS = 20;
+// Max dimension for mobile performance optimization (approx 4MP vs 20MP)
+const MAX_IMAGE_DIMENSION = 2048;
 
 const App: React.FC = () => {
   const [activeTool, setActiveTool] = useState<ToolType>(ToolType.WARP);
@@ -81,13 +83,6 @@ const App: React.FC = () => {
   const undo = useCallback(() => {
     if (historyIndex >= 0) {
       const step = history[historyIndex];
-      
-      // Before restoring, if we are at the "tip" of history (index === length -1), 
-      // we might want to save the *current* state as a redo-able step if it wasn't saved?
-      // Typically, "undo" means "go back to previous state".
-      // Current implementation assumes we saved *before* the action.
-      // So restoring history[historyIndex] restores the state *before* the change.
-      
       setLayers(cloneLayers(step.layers));
       setActiveLayerId(step.activeLayerId);
       setHistoryIndex(prev => prev - 1);
@@ -98,49 +93,7 @@ const App: React.FC = () => {
     if (historyIndex < history.length - 1) {
       const nextIndex = historyIndex + 1;
       const step = history[nextIndex];
-      // Wait, standard undo implementation:
-      // Stack: [State A, State B, State C]
-      // Current: State D (not in stack yet? or stack includes current?)
-      
-      // Better approach: 
-      // Undo stack contains PAST states.
-      // We also need to save the state we are undoing FROM if we want to redo back to it.
-      // Simpler approach for this app:
-      // When `saveHistory` is called, we push the *current* state (State A) before mutating to State B.
-      // Undo restores State A. Redo needs State B.
-      
-      // Let's fix logic: 
-      // 1. `saveHistory` saves the state *before* modification.
-      // 2. `undo` takes us to that saved state.
-      // 3. To `redo`, we actually need the state *after* modification to be stored somewhere.
-      
-      // Alternate Standard Logic:
-      // History array contains ALL states including current?
-      // Or History array contains snapshots. 
-      // Let's stick to: history[i] is the state at point i.
-      // When we modify, we push new state.
-      // But `saveHistory` is usually called onMouseDown (before change).
-      // So we save `current` state. Then user changes state. The `current` (visual) state is "future".
-      // We actually need to commit the *result* to history for Redo to work.
-      
-      // Let's use this flow:
-      // 1. OnMouseDown: Call `saveHistory()`. Snapshots current `layers`. Pushes to stack. Pointer moves to end.
-      // 2. User Modifies `layers` in real-time or on MouseUp.
-      // 3. Wait, if we save on MouseDown, we save the "Clean" state.
-      // 4. Undo restores "Clean" state.
-      // 5. Where is "Dirty" state for Redo?
-      //    We need to save the *result* state too.
-      
-      // REVISED HISTORY STRATEGY:
-      // We only push to history *after* a change is committed (MouseUp), but we push the *result*.
-      // AND we need an initial state pushed on load.
-      
-      // Actually, standard pattern:
-      // history = [InitialState, State1, State2]
-      // index = 2 (pointing to State2, which is current)
-      // Undo -> index=1, setLayers(State1)
-      // Redo -> index=2, setLayers(State2)
-      // Action -> remove index+1...end, push NewState, index++
+      // Note: Logic placeholder, see redoAction implementation below
     }
   }, [history, historyIndex]);
 
@@ -202,8 +155,7 @@ const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [historyIndex, history]); // Deps are needed to access current state in closure
 
-  // Initialize history with empty state or when first layer added?
-  // Easier: When App loads, push initial state.
+  // Initialize history with empty state
   useEffect(() => {
       if (history.length === 0) {
           const initial: HistoryStep = { layers: [], activeLayerId: '' };
@@ -212,31 +164,6 @@ const App: React.FC = () => {
       }
   }, []);
 
-  // Wrapper for changes that should be undoable
-  const handleLayerUpdateWithHistory = (id: string, updates: Partial<Layer>) => {
-      const newLayers = layers.map(l => l.id === id ? { ...l, ...updates } : l);
-      setLayers(newLayers);
-      // We assume this is called on "End" of interaction (e.g. MouseUp on slider/transform)
-      // But components might call it continuously.
-      // We need a specific "Commit" signal or debounce. 
-      // For ToolsPanel sliders, onChange calls this continuously. 
-      // We will handle slider history separately or ignore continuous updates for now.
-  };
-
-  // Dedicated function for LiquifyCanvas to call when a stroke/transform ends
-  const onCanvasInteractionEnd = (updatedLayers: Layer[]) => {
-      setLayers(updatedLayers);
-      commitToHistory(updatedLayers, activeLayerId);
-  };
-  
-  // Specific wrapper for layer property updates (sliders) to commit only on mouse up?
-  // For now, let's just commit every updateLayer call if it comes from sliders?
-  // No, that floods history. 
-  // Let's modify updateLayer to just update state, and tools/canvas call commit explicitly.
-  const updateLayerStateOnly = (id: string, updates: Partial<Layer>) => {
-      setLayers(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l));
-  };
-  
   // Handlers for Tools Panel
   // We need to commit history when adding/deleting layers
   const addImageLayer = (src: string, name: string = 'Layer') => {
@@ -244,30 +171,52 @@ const App: React.FC = () => {
     img.crossOrigin = "anonymous";
     img.src = src;
     img.onload = () => {
+       // --- Optimization: Downscale Logic ---
+       let width = img.width;
+       let height = img.height;
+
+       if (width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION) {
+           const ratio = width / height;
+           if (width > height) {
+               width = MAX_IMAGE_DIMENSION;
+               height = Math.round(width / ratio);
+           } else {
+               height = MAX_IMAGE_DIMENSION;
+               width = Math.round(height * ratio);
+           }
+       }
+
        const canvas = document.createElement('canvas');
-       canvas.width = img.width;
-       canvas.height = img.height;
+       canvas.width = width;
+       canvas.height = height;
        const ctx = canvas.getContext('2d');
-       ctx?.drawImage(img, 0, 0);
-       const imageData = ctx?.getImageData(0, 0, img.width, img.height);
        
-       if (imageData) {
-           const newLayer: Layer = {
-               id: Date.now().toString(),
-               name: `${name} ${layers.length + 1}`,
-               visible: true,
-               imageData: imageData,
-               blendMode: 'source-over',
-               opacity: 1,
-               x: 0,
-               y: 0,
-               scale: 1,
-               rotation: 0
-           };
-           const newLayers = [...layers, newLayer];
-           setLayers(newLayers);
-           setActiveLayerId(newLayer.id);
-           commitToHistory(newLayers, newLayer.id);
+       if (ctx) {
+           // Use high quality scaling
+           ctx.imageSmoothingEnabled = true;
+           ctx.imageSmoothingQuality = 'high';
+           ctx.drawImage(img, 0, 0, width, height);
+           
+           const imageData = ctx.getImageData(0, 0, width, height);
+           
+           if (imageData) {
+               const newLayer: Layer = {
+                   id: Date.now().toString(),
+                   name: `${name} ${layers.length + 1}`,
+                   visible: true,
+                   imageData: imageData,
+                   blendMode: 'source-over',
+                   opacity: 1,
+                   x: 0,
+                   y: 0,
+                   scale: 1,
+                   rotation: 0
+               };
+               const newLayers = [...layers, newLayer];
+               setLayers(newLayers);
+               setActiveLayerId(newLayer.id);
+               commitToHistory(newLayers, newLayer.id);
+           }
        }
     };
   };
@@ -313,7 +262,7 @@ const App: React.FC = () => {
   const toggleLayerVisibility = (id: string) => {
       const newLayers = layers.map(l => l.id === id ? { ...l, visible: !l.visible } : l);
       setLayers(newLayers);
-      commitToHistory(newLayers, activeLayerId); // Toggle is a discrete action
+      commitToHistory(newLayers, activeLayerId);
   };
   
   const deleteLayer = (id: string) => {
@@ -371,6 +320,16 @@ const App: React.FC = () => {
       const newLayers = layers.map(l => l.id === id ? { ...l, ...updates } : l);
       setLayers(newLayers);
       commitToHistory(newLayers, activeLayerId);
+  };
+
+  // Dedicated function for LiquifyCanvas to call when a stroke/transform ends
+  const onCanvasInteractionEnd = (updatedLayers: Layer[]) => {
+      setLayers(updatedLayers);
+      commitToHistory(updatedLayers, activeLayerId);
+  };
+  
+  const updateLayerStateOnly = (id: string, updates: Partial<Layer>) => {
+      setLayers(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l));
   };
 
   return (
